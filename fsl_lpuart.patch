@@ -1,0 +1,225 @@
+--- ./old/fsl_lpuart.c	2023-08-21 10:40:32.664506900 +0800
++++ ./new/fsl_lpuart.c	2023-08-21 14:43:25.221087500 +0800
+@@ -31,6 +31,7 @@
+ #include <linux/serial_core.h>
+ #include <linux/slab.h>
+ #include <linux/tty_flip.h>
++#include <linux/hrtimer.h>
+ 
+ /* All registers are 8-bit width */
+ #define UARTBDH			0x00
+@@ -244,6 +245,7 @@
+ #define DRIVER_NAME	"fsl-lpuart"
+ #define DEV_NAME	"ttyLP"
+ #define UART_NR		6
++#define LIN_PORT_NUM 	3
+ 
+ /* IMX lpuart has four extra unused regs located at the beginning */
+ #define IMX_REG_OFF	0x10
+@@ -282,6 +284,27 @@
+ 	unsigned int		dma_tx_nents;
+ 	wait_queue_head_t	dma_wait;
+ };
++/* LIN declaration */
++typedef enum
++{
++	LIN_STAGE_BREAK = 0,
++	LIN_STAGE_SYNC,
++	LIN_STAGE_PID,
++	LIN_STAGE_RXDATA,
++	LIN_STAGE_TXDATA,
++	LIN_STAGE_RXCRC,
++	LIN_STAGE_TXCRC
++} tLIN_stage;   // LIN transmission stages
++
++#define LIN_ID1 	0x10
++#define LIN_ID2 	0x11
++
++struct hrtimer          rx_timer;       /* RX timeout timer */
++ktime_t                 rx_timer_timeout; /* RX timeout timer value */
++struct lpuart_port	    *uart3_port = NULL;
++
++uint8_t LINRxData[12], LINRxByteCnt = 0, LINDataLength, CmdRx; 
++tLIN_stage 	LIN_stage;
+ 
+ struct lpuart_soc_data {
+ 	char	iotype;
+@@ -871,6 +894,36 @@
+ 	tty_flip_buffer_push(port);
+ 	return IRQ_HANDLED;
+ }
++/* Enable LIN break detection */
++static int lin_break_detection_enable(void *dev_id) {
++	struct lpuart_port *sport = dev_id;
++	unsigned long sts;
++
++	if (!sport)
++		return -1;
++	if (sport->port.line == LIN_PORT_NUM) {
++		LINRxByteCnt = 0;
++		LIN_stage = LIN_STAGE_BREAK;
++		sts = lpuart32_read(&sport->port, UARTSTAT);
++		sts |= UARTSTAT_LBKDE; /* LBKDE=1: LIN break detect is eabled */
++		lpuart32_write(&sport->port, sts, UARTSTAT);
++	}
++	return 0;
++}
++
++/* LIN Rx timeout handler */
++static enum hrtimer_restart lin_rx_timeout_handler(struct hrtimer *hrtimer)
++{
++        /*
++         * Signal timeout when:
++         * master: We did not receive as much characters as expected
++         * slave: * we did not receive any data bytes at all
++         *        * we know the length and didn't receive enough
++         */
++
++	lin_break_detection_enable(uart3_port);
++        return HRTIMER_NORESTART;
++}
+ 
+ static irqreturn_t lpuart32_rxint(int irq, void *dev_id)
+ {
+@@ -879,6 +932,7 @@
+ 	struct tty_port *port = &sport->port.state->port;
+ 	unsigned long flags;
+ 	unsigned long rx, sr;
++	unsigned long sts;
+ 
+ 	spin_lock_irqsave(&sport->port.lock, flags);
+ 
+@@ -938,6 +992,52 @@
+ 
+ 		rx &= UARTDATA_MASK;
+ 		tty_insert_flip_char(port, rx, flg);
++		
++		// LIN Rx handler 
++		if (sport->port.line == LIN_PORT_NUM) {
++			LINRxData[LINRxByteCnt++] = (uint8_t)rx;
++			switch(LIN_stage)
++			{
++				case LIN_STAGE_SYNC:
++					if (LINRxData[LINRxByteCnt-1] == 0x55)
++						LIN_stage = LIN_STAGE_PID;
++					break;
++
++				case LIN_STAGE_PID:
++					CmdRx = LINRxData[LINRxByteCnt-1] & 0x3F;
++					switch(CmdRx) // based on received ID set data length and TX or RX operation
++					{
++						case LIN_ID1:
++							LINDataLength = 8;
++							LIN_stage = LIN_STAGE_RXDATA;
++						    break;
++						case LIN_ID2:
++							LINDataLength = 4;
++							LIN_stage = LIN_STAGE_RXDATA;
++							break;
++						default:
++							/* Cancel rx timeout timer */
++							hrtimer_cancel(&rx_timer);
++							lin_break_detection_enable(uart3_port);
++							break;
++					}
++					break;
++
++				case LIN_STAGE_RXDATA:
++					if((LINRxByteCnt-2) >= LINDataLength)
++						LIN_stage = LIN_STAGE_RXCRC;
++					break;
++
++				case LIN_STAGE_RXCRC:
++					/* Cancel rx timeout timer */
++					hrtimer_cancel(&rx_timer);
++					lin_break_detection_enable(uart3_port);
++					break;
++
++				default:
++					break;
++			}
++		}	
+ 	}
+ 
+ out:
+@@ -981,10 +1081,30 @@
+ 	if (!sts)
+ 		return IRQ_NONE;
+ 
++	if (sport->port.line == LIN_PORT_NUM) {
++		/* LIN break character detected? */
++		if ((sts & UARTSTAT_LBKDIF) != 0) {
++			sts = lpuart32_read(&sport->port, UARTSTAT);
++			sts |= UARTSTAT_LBKDIF; /* Write 1 to clear flag */
++			sts &= ~UARTSTAT_LBKDE; /* LBKDE=0: LIN break detect is disabled */
++			lpuart32_write(&sport->port, sts, UARTSTAT);
++			sts = lpuart32_read(&sport->port, UARTSTAT);
++			LINRxByteCnt = 0;
++			LIN_stage = LIN_STAGE_SYNC;
++			/* Start rx timeout timer */
++			hrtimer_start(&rx_timer,
++					ktime_add(ktime_get(), rx_timer_timeout),
++					HRTIMER_MODE_ABS);
++		}
++	}
++
+ 	if (!(crdma & UARTBAUD_RDMAE) && rxcount > 0) {
+ 		if (!sport->lpuart_dma_rx_use ||
+-			(sts & (UARTSTAT_PE | UARTSTAT_NF | UARTSTAT_FE)))
++			(sts & (UARTSTAT_PE | UARTSTAT_NF | UARTSTAT_FE))) {
+ 			lpuart32_rxint(irq, dev_id);
++			if (sport->port.line == LIN_PORT_NUM)
++				sts = lpuart32_read(&sport->port, UARTSTAT);
++		}
+ 		else if (sport->lpuart_dma_rx_use && sport->dma_rx_chan_active)
+ 			lpuart_prepare_rx(sport);
+ 	} else if (!(crdma & UARTBAUD_RDMAE) && (sts & UARTSTAT_IDLE) &&
+@@ -1513,9 +1633,26 @@
+ 		UARTFIFO_FIFOSIZE_MASK) + 1);
+ 
+ 	sport->txfifo_watermark = sport->txfifo_size >> 1;
+-	sport->rxfifo_watermark = 1;
++	sport->rxfifo_watermark = 0;
+ 	sport->rts_watermark = sport->rxfifo_size >> 1;
+ 	sport->rxdma_len = FSL_UART_RX_DMA_BUFFER_SIZE;
++	/* Configure LPUART for LIN transmission */
++	if (sport->port.line == LIN_PORT_NUM) {
++		temp = lpuart32_read(&sport->port, UARTBAUD);
++		temp |= UARTBAUD_LBKDIE; /* LBKDIE=1: Hardware interrupt requested when LPUART_STAT[LBKDIF] flag is 1 */
++		lpuart32_write(&sport->port, temp, UARTBAUD);
++		temp = lpuart32_read(&sport->port, UARTSTAT);
++		temp &= ~(UARTSTAT_MSBF); /* MSBF=0: LSB (bit0) is the first bit */
++		temp |= UARTSTAT_BRK13; /* BRK13=1: Break character is transmitted with length of 13 bit times */
++		temp |= UARTSTAT_LBKDE; /* LBKDE=1: Disable receiver buffer at break detection, LIN break detect is enabled. */
++		lpuart32_write(&sport->port, temp, UARTSTAT);
++
++		/* Register a timer for LIN Rx timeout */
++		hrtimer_init(&rx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		rx_timer.function = lin_rx_timeout_handler;
++		rx_timer_timeout = ns_to_ktime(10000000); // 10 ms
++		uart3_port = sport;	
++	}
+ 
+ 	if (sport->dma_rx_chan && !lpuart_dma_rx_request(port)) {
+ 		sport->lpuart_dma_rx_use = true;
+@@ -1543,6 +1680,9 @@
+ 	temp = lpuart32_read(&sport->port, UARTCTRL);
+ 	temp |= (UARTCTRL_RIE | UARTCTRL_RE | UARTCTRL_TE);
+ 	temp |= UARTCTRL_ILIE;
++	if (sport->port.line == LIN_PORT_NUM) {
++		temp |= UARTCTRL_ILT; /* ILT=1: Idle character bit count starts after stop bit */
++	}
+ 	temp |= UARTCTRL_IDLECFG << UARTCTRL_IDLECFG_OFF;
+ 	lpuart32_write(&sport->port, temp, UARTCTRL);
+ 
+@@ -1910,6 +2050,10 @@
+ 	else
+ 		bd &= ~UARTBAUD_SBNS;
+ 
++	if (sport->port.line == LIN_PORT_NUM) {
++		bd &= ~UARTBAUD_SBNS;
++	}
++
+ 	/* parity must be enabled when CS7 to match 8-bits format */
+ 	if ((termios->c_cflag & CSIZE) == CS7)
+ 		termios->c_cflag |= PARENB;
