@@ -1,8 +1,7 @@
 # NXP IMX8QM Linux LIN 
 
 ## Introduction
-This repository contains a patch for the FSL LPUART (Low Power UART) driver in the Linux kernel. The patch introduces changes to the `fsl_lpuart.c` file to add LIN (Local Interconnect Network) support.
-One can refer `lin_test.c` for sending and reading LIN data from userspace.
+A patch for the LPUART driver in the Linux kernel for adding LIN (Local Interconnect Network) support. 
 
 ## Prerequisites
 * [linux-lin](https://github.com/lin-bus/linux-lin) have to be integrated into your Linux OS or Android OS.
